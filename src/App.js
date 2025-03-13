@@ -1,72 +1,86 @@
 import React, { useRef, useEffect, useState } from "react";
 import io from "socket.io-client";
 
-const socket = io(process.env.REACT_APP_SIGNALING_SERVER_URL);
+const socket = io(process.env.REACT_APP_SIGNALING_SERVER_URL); // Connect to signaling server
 
 const App = () => {
   const localVideoRef = useRef(null);
-  const peerConnections = useRef({});
+  const remoteVideoRef = useRef(null);
+  const peerConnection = useRef(null);
   const [isCallStarted, setIsCallStarted] = useState(false);
-  const [users, setUsers] = useState([]);
+  const iceCandidatesQueue = [];
 
   useEffect(() => {
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then((stream) => {
         localVideoRef.current.srcObject = stream;
-
-        socket.on("user-joined", (userId) => {
-          const peerConnection = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-          });
-
-          stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
-
-          peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
-              socket.emit("ice-candidate", { to: userId, candidate: event.candidate });
-            }
-          };
-
-          peerConnection.ontrack = (event) => {
-            // Handle remote stream
-          };
-
-          peerConnections.current[userId] = peerConnection;
+        peerConnection.current = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
         });
 
-        socket.on("offer", async ({ from, offer }) => {
-          const peerConnection = peerConnections.current[from];
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
-          socket.emit("answer", { to: from, answer });
-        });
+        stream.getTracks().forEach(track => peerConnection.current.addTrack(track, stream));
 
-        socket.on("answer", async ({ from, answer }) => {
-          const peerConnection = peerConnections.current[from];
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-        });
+        peerConnection.current.onicecandidate = (event) => {
+          if (event.candidate) {
+            console.log("Sending ICE candidate:", event.candidate);
+            socket.emit("ice-candidate", event.candidate);
+          }
+        };
 
-        socket.on("ice-candidate", async ({ from, candidate }) => {
-          const peerConnection = peerConnections.current[from];
-          await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-        });
-
-        socket.emit("join-call");
+        peerConnection.current.ontrack = (event) => {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        };
       });
 
-    socket.on("all-users", (users) => {
-      setUsers(users);
+    socket.on("offer", async (offer) => {
+      console.log("Received offer:", offer);
+      if (peerConnection.current.signalingState === "stable" || peerConnection.current.signalingState === "have-local-offer") {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.current.createAnswer();
+        await peerConnection.current.setLocalDescription(answer);
+        socket.emit("answer", answer);
+
+        // Process queued ICE candidates
+        while (iceCandidatesQueue.length) {
+          const candidate = iceCandidatesQueue.shift();
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+      } else {
+        console.warn("Peer connection is not in a stable state to set remote offer.");
+      }
+    });
+
+    socket.on("answer", async (answer) => {
+      console.log("Received answer:", answer);
+      if (peerConnection.current.signalingState === "have-local-offer") {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+
+        // Process queued ICE candidates
+        while (iceCandidatesQueue.length) {
+          const candidate = iceCandidatesQueue.shift();
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+      } else {
+        console.warn("Peer connection is not in a state to accept an answer.");
+      }
+    });
+
+    socket.on("ice-candidate", async (candidate) => {
+      if (candidate) {
+        console.log("Received ICE candidate:", candidate);
+        if (peerConnection.current.remoteDescription) {
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        } else {
+          iceCandidatesQueue.push(candidate);
+        }
+      }
     });
   }, []);
 
   const startCall = async () => {
-    users.forEach(async (userId) => {
-      const peerConnection = peerConnections.current[userId];
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-      socket.emit("offer", { to: userId, offer });
-    });
+    const offer = await peerConnection.current.createOffer();
+    await peerConnection.current.setLocalDescription(offer);
+    socket.emit("offer", offer);
     setIsCallStarted(true);
   };
 
@@ -75,7 +89,7 @@ const App = () => {
       <h2>Real-Time Video Call</h2>
       <div>
         <video ref={localVideoRef} autoPlay playsInline muted />
-        {/* Add video elements for remote streams */}
+        <video ref={remoteVideoRef} autoPlay playsInline />
       </div>
       {!isCallStarted && <button onClick={startCall}>Start Call</button>}
     </div>
